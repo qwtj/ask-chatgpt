@@ -1,0 +1,186 @@
+#!/usr/bin/env zsh
+# ask-chatgpt: minimal-friction CLI for the OpenAI chat completions API
+set -euo pipefail
+
+##############################################################################
+# Help / usage
+##############################################################################
+usage() {
+    cat <<EOF
+Usage: ask-chatgpt [-m <model>] [-g] [-f <file>] [-p <prompt file>] [-v] [-i] <prompt>
+  <prompt>                Prompt text to send to the ChatGPT API.
+  -p <prompt path>        Read prompt from file.
+  -m <model>              Model name (default: ${OPENAI_DEFAULT_MODEL:=gpt-3.5-turbo}).
+  -f <file>               Attach a local file (its contents are appended to the prompt).
+  -g                      Render output with glow.
+  -v                      Verbose diagnostics to stderr.
+  -i                      List available models and exit.
+  -h | --help             Show this message.
+EOF
+    exit 1
+}
+
+##############################################################################
+# Model listing
+##############################################################################
+list_available_models() {
+    local VERBOSE=$1
+    local API_URL=https://api.openai.com/v1/models
+
+    if [[ -z ${OPENAI_API_KEY:-} ]]; then
+        echo "Warning: OPENAI_API_KEY not set." >&2
+        printf "Available models:\n  gpt-3.5-turbo\n  gpt-4\n"
+        return 1
+    fi
+
+    [[ $VERBOSE == true ]] && echo "GET $API_URL" >&2
+    local RESP
+    RESP=$(curl -s -H "Authorization: Bearer $OPENAI_API_KEY" "$API_URL")
+
+    if echo "$RESP" | jq -e '.data' >/dev/null 2>&1; then
+        echo "$RESP" | jq -r '.data[].id' | sort -u
+    else
+        echo "Warning: failed to query API; falling back." >&2
+        printf "gpt-3.5-turbo\ngpt-4\n"
+    fi
+}
+
+##############################################################################
+# Low-level request helper
+##############################################################################
+send_chatgpt_request() {
+    local MODEL=$1 VERBOSE=$2 BODY_FILE=$3
+    local API_URL="https://api.openai.com/v1/chat/completions"
+
+    jq . "$BODY_FILE" >/dev/null      # die if the JSON we built is corrupt
+
+    [[ $VERBOSE == true ]] && {
+        echo -e "\nPOST $API_URL\n" >&2
+        cat "$BODY_FILE" >&2
+        echo >&2
+    }
+
+    local RESP
+    RESP=$(curl -s -H "Authorization: Bearer $OPENAI_API_KEY" \
+                 -H "Content-Type: application/json" \
+                 "$API_URL" \
+                 --data-binary @"$BODY_FILE" | base64)
+
+    if ! echo "$RESP" | base64 --decode | jq -e '.choices' >/dev/null 2>&1; then
+        echo -e "Error: API returned invalid JSON:\n$RESP" >&2
+        exit 1
+    fi
+
+    echo "$RESP" | base64 --decode | jq -r '.choices[] | .message.content'
+}
+
+##############################################################################
+# High-level helpers – PROMPT COMES ON STDIN (no argv length limit)
+##############################################################################
+send_prompt_to_chatgpt() {
+    local MODEL=$1 VERBOSE=$2
+    local PROMPT
+    PROMPT=$(cat)                     # read from stdin (handles huge prompts)
+
+    local BODY
+    BODY=$(jq -n --arg model "$MODEL" --arg content "$PROMPT" \
+              '{model:$model, messages:[{role:"user", content:$content}]}')
+
+    local TMP
+    TMP=$(mktemp -t ask.chatgpt.body)
+    printf '%s' "$BODY" >"$TMP"
+    send_chatgpt_request "$MODEL" "$VERBOSE" "$TMP"
+    rm -f "$TMP"
+}
+
+send_prompt_with_file_to_chatgpt() {
+    local MODEL=$1 FILE=$2 VERBOSE=$3
+    local PROMPT
+    PROMPT=$(cat)
+
+    if [[ ! -f $FILE ]]; then
+        echo "Error: file not found: $FILE" >&2
+        exit 1
+    fi
+
+    local FILE_CONTENT
+    FILE_CONTENT=$(cat "$FILE")
+
+    local COMBINED="${PROMPT}\n\n----- Attached file: $(basename "$FILE") -----\n${FILE_CONTENT}"
+    local BODY
+    BODY=$(jq -n --arg model "$MODEL" --arg content "$COMBINED" \
+              '{model:$model, messages:[{role:"user", content:$content}]}')
+
+    local TMP
+    TMP=$(mktemp -t ask.chatgpt.body)
+    printf '%s' "$BODY" >"$TMP"
+    send_chatgpt_request "$MODEL" "$VERBOSE" "$TMP"
+    rm -f "$TMP"
+}
+
+##############################################################################
+# Argument parsing
+##############################################################################
+parse_arguments() {
+    local OPTIND=1 opt
+    MODEL=${OPENAI_DEFAULT_MODEL:-gpt-3.5-turbo}
+    ATTACH=""
+    USE_GLOW=false
+    VERBOSE=false
+    PROMPT=""
+
+    while getopts ":p:m:f:gvhi-:" opt; do
+        case $opt in
+            p) [[ -f $OPTARG ]] || { echo "No such file: $OPTARG" >&2; exit 1; }
+               PROMPT=$(cat "$OPTARG") ;;
+            m) MODEL=$OPTARG ;;
+            f) ATTACH=$OPTARG ;;
+            g) USE_GLOW=true ;;
+            v) VERBOSE=true ;;
+            h) usage ;;
+            i) list_available_models "$VERBOSE"; exit ;;
+            -) [[ $OPTARG == help ]] && usage ;;
+            *) echo "Invalid option: -$OPTARG" >&2; usage ;;
+        esac
+    done
+    shift $((OPTIND-1))
+
+    # Anything left on the command line is appended to $PROMPT
+    [[ $# -gt 0 ]] && PROMPT+=$'\n'"$*"
+
+    if [[ -s /dev/stdin || -p /dev/stdin ]]; then
+        if [[ -z "$PROMPT" ]]; then
+            PROMPT="$(cat -)"
+        else
+            PROMPT="$PROMPT\n$(cat -)"
+        fi
+    fi
+
+    [[ -z $PROMPT ]] && { echo "Error: no prompt supplied." >&2; usage; }
+
+    export MODEL USE_GLOW VERBOSE ATTACH PROMPT
+}
+
+##############################################################################
+# Main
+##############################################################################
+main() {
+    [[ -z ${OPENAI_API_KEY:-} ]] && {
+        echo "OPENAI_API_KEY is not set." >&2; exit 1;
+    }
+
+    parse_arguments "$@"
+
+    if [[ -n $ATTACH ]]; then
+        printf '%s' "$PROMPT" | \
+            send_prompt_with_file_to_chatgpt "$MODEL" "$ATTACH" "$VERBOSE"
+    else
+        printf '%s' "$PROMPT" | \
+            send_prompt_to_chatgpt "$MODEL" "$VERBOSE"
+    fi | {    # render via glow if requested
+        if [[ $USE_GLOW == true ]]; then glow; else cat; fi
+    }
+}
+
+main "$@"
+
